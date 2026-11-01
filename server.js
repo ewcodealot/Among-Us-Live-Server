@@ -23,6 +23,10 @@ app.get('/', (req, res) => {
 // 3. Socket.io Real-time Communication
 const activeGames = {};
 
+function shuffle(array) {
+    return array.sort(() => Math.random() - 0.5);
+}
+
 io.on('connection', (socket) => {
 
     // Host creates game
@@ -72,6 +76,41 @@ io.on('connection', (socket) => {
                 break;
             }
         }
+    });
+
+    socket.on('host:start_game', ({ roomCode }) => {
+        const game = activeGames[roomCode];
+        if (!game) return;
+
+        const players = game.players;
+        const settings = game.config.gameSettings;
+        const allTasks = game.config.tasks;
+
+        // 1. Shuffle players and determine how many impostors to assign
+        const shuffledPlayers = shuffle([...players]);
+        const impostorCount = Math.min(settings.impostorCount, shuffledPlayers.length - 1);
+
+        // 2. Assign roles and tasks to each player individually
+        shuffledPlayers.forEach((player, index) => {
+            const isImpostor = index < impostorCount;
+            
+            let assignedTasks = [];
+            if (!isImpostor) {
+                // Give each crewmate a randomized subset of 3 tasks from the config file
+                assignedTasks = shuffle([...allTasks]).slice(0, 3);
+            }
+
+            // Send private role and task data directly to that specific player's socket
+            io.to(player.id).emit('game_started', {
+                role: isImpostor ? 'Impostor' : 'Crewmate',
+                tasks: assignedTasks
+            });
+        });
+
+        // 3. Update game status and notify host
+        game.status = 'playing';
+        io.to(roomCode).emit('host_game_started');
+        console.log(`Game started in room ${roomCode} with ${impostorCount} impostors.`);
     });
 });
 
