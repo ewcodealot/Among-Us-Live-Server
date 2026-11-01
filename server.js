@@ -5,7 +5,12 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:80", // Replace with your frontend URL
+    methods: ["GET", "POST"]
+  }
+});
 
 // 1. Serve all static files from your current directory (or a specific frontend folder)
 // This tells Express to serve index.html, style.css, and your folders (Host, Player, Setup, System)
@@ -16,18 +21,57 @@ app.get('/', (req, res) => {
 });
 
 // 3. Socket.io Real-time Communication
-io.on('connection', (socket) => {
-    console.log('A user connected:', socket.id);
+const activeGames = {};
 
-    // Listen for custom game events from players or hosts
-    socket.on('player_action', (data) => {
-        console.log('Received action:', data);
-        // Broadcast updates to everyone else or handle game logic here
-        io.emit('game_update', data);
+io.on('connection', (socket) => {
+
+    // Host creates game
+    socket.on('host:create_game', ({ roomCode, config }) => {
+        activeGames[roomCode] = {
+            hostId: socket.id,
+            config: config,
+            players: [],
+            status: 'lobby'
+        };
+
+        socket.join(roomCode);
+        socket.emit('game_created_success', { roomCode });
+        console.log(`Game created: ${roomCode}`);
+    });
+
+    // Player joins game
+    socket.on('player:join_game', ({ roomCode, playerName }) => {
+        const game = activeGames[roomCode];
+
+        if (!game) {
+            socket.emit('error_message', 'Room code not found!');
+            return;
+        }
+
+        // Add player to memory
+        const newPlayer = { id: socket.id, name: playerName };
+        game.players.push(newPlayer);
+        socket.join(roomCode);
+
+        // Tell player they joined successfully
+        socket.emit('join_success', { roomCode });
+
+        // Send updated player list to EVERYONE in the room (including host)
+        io.to(roomCode).emit('update_player_list', game.players);
+        console.log(`${playerName} joined room ${roomCode}`);
     });
 
     socket.on('disconnect', () => {
-        console.log('A user disconnected:', socket.id);
+        // Simple cleanup: remove players from active rooms on disconnect
+        for (const code in activeGames) {
+            const game = activeGames[code];
+            const index = game.players.findIndex(p => p.id === socket.id);
+            if (index !== -1) {
+                game.players.splice(index, 1);
+                io.to(code).emit('update_player_list', game.players);
+                break;
+            }
+        }
     });
 });
 
