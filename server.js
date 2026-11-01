@@ -32,7 +32,7 @@ io.on('connection', (socket) => {
 });
 
 // 4. Start the server on port 3000
-const PORT = 3000;
+const PORT = 80;
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Game server running at http://localhost:${PORT}`);
 });
