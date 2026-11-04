@@ -45,7 +45,9 @@ io.on('connection', (socket) => {
             hostId: socket.id,
             config: config,
             players: [],
-            status: 'lobby'
+            status: 'lobby',
+            taskTotal: 0,
+            tasksDone: 0
         };
 
         socket.join(roomCode);
@@ -129,6 +131,9 @@ io.on('connection', (socket) => {
         const settings = game.config.gameSettings;
         const allTasks = game.config.tasks;
 
+        game.taskTotal = 0;
+        game.tasksDone = 0;
+
         // 1. Shuffle players and determine how many impostors to assign
         const shuffledPlayers = shuffle([...players]);
         const impostorCount = Math.max(0, Math.min(settings.impostorCount, shuffledPlayers.length - 1));
@@ -141,10 +146,13 @@ io.on('connection', (socket) => {
             
             let assignedTasks = [];
             // Give each crewmate a randomized subset of 3 tasks from the config file
-            assignedTasks = shuffle([...allTasks]).slice(0, 5);
+            assignedTasks = shuffle(allTasks.map(task => ({ ...task, completed: false }))).slice(0, 5);
 
             player.role = isImpostor ? 'Impostor' : 'Crewmate';
             player.tasks = assignedTasks;
+            if (!isImpostor) {
+                game.taskTotal += assignedTasks.length;
+            }
 
             // Send private role and task data directly to that specific player's socket
             io.to(player.id).emit('game_started', {
@@ -175,15 +183,29 @@ io.on('connection', (socket) => {
         if (!task || task.completed) return;
 
         task.completed = true;
+        if (player.role === 'Crewmate') {
+            game.tasksDone++;
+        }
         console.log(`${player.name} completed task ${task.title}`);
         broadcastGameUpdate(roomCode, `${player.name} completed ${task.title}`);
 
         const allTasksCompleted = player.tasks.every(t => t.completed);
         if (allTasksCompleted) {
             io.to(player.id).emit('all_tasks_completed');
+            broadcastGameUpdate(roomCode, `${player.name} completed all tasks`);
+        }
+
+        if (player.role === 'Crewmate' && game.taskTotal > 0 && game.tasksDone >= game.taskTotal) {
+            io.to(roomCode).emit('crewmate_win');
+            broadcastGameUpdate(roomCode, `The Crewmates have won! All tasks have been completed.`);
+            endGame(roomCode);
         }
     });
 });
+
+function endGame(roomCode) {
+    console.log(`Game ended in room ${roomCode}`);
+}
 
 // 4. Start the server on port 3000
 const PORT = 80;
