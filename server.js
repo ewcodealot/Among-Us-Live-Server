@@ -33,6 +33,10 @@ function getPlayerList(game) {
     return getConnectedPlayers(game).map(({ id, name }) => ({ id, name }));
 }
 
+function broadcastGameUpdate(roomCode, message) {
+    io.to(roomCode).emit('game:update', { message });
+}
+
 io.on('connection', (socket) => {
 
     // Host creates game
@@ -46,6 +50,7 @@ io.on('connection', (socket) => {
 
         socket.join(roomCode);
         socket.emit('game_created_success', { roomCode });
+        broadcastGameUpdate(roomCode, 'Game created');
         console.log(`Game created: ${roomCode}`);
     });
 
@@ -89,6 +94,7 @@ io.on('connection', (socket) => {
 
         // Send updated player list to EVERYONE in the room (including host)
         io.to(roomCode).emit('update_player_list', getPlayerList(game));
+        broadcastGameUpdate(roomCode, `${player.name} joined`);
 
         if (game.status === 'playing' && player.role && player.tasks) {
             socket.emit('game_started', {
@@ -105,9 +111,11 @@ io.on('connection', (socket) => {
             const game = activeGames[code];
             const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
             if (player) {
+                const playerName = player.name;
                 player.connected = false;
                 player.id = null;
                 io.to(code).emit('update_player_list', getPlayerList(game));
+                broadcastGameUpdate(code, `${playerName} disconnected`);
                 break;
             }
         }
@@ -124,6 +132,8 @@ io.on('connection', (socket) => {
         // 1. Shuffle players and determine how many impostors to assign
         const shuffledPlayers = shuffle([...players]);
         const impostorCount = Math.max(0, Math.min(settings.impostorCount, shuffledPlayers.length - 1));
+
+        socket.emit('host:started_game', { roomCode });
 
         // 2. Assign roles and tasks to each player individually
         shuffledPlayers.forEach((player, index) => {
@@ -146,7 +156,32 @@ io.on('connection', (socket) => {
         // 3. Update game status and notify host
         game.status = 'playing';
         io.to(roomCode).emit('host_game_started');
+        broadcastGameUpdate(roomCode, 'Game started');
         console.log(`Game started in room ${roomCode} with ${impostorCount} impostors.`);
+    });
+
+    socket.on('task:completed', (data) => {
+        const taskId = data?.taskId;
+        const gameEntry = Object.entries(activeGames).find(([, game]) =>
+            game.players.some(player => player.id === socket.id)
+        );
+        if (!gameEntry) return;
+        const [roomCode, game] = gameEntry;
+
+        const player = game.players.find(p => p.id === socket.id);
+        if (!player || !Array.isArray(player.tasks)) return;
+
+        const task = player.tasks.find(t => t.id === taskId);
+        if (!task || task.completed) return;
+
+        task.completed = true;
+        console.log(`${player.name} completed task ${task.title}`);
+        broadcastGameUpdate(roomCode, `${player.name} completed ${task.title}`);
+
+        const allTasksCompleted = player.tasks.every(t => t.completed);
+        if (allTasksCompleted) {
+            io.to(player.id).emit('all_tasks_completed');
+        }
     });
 });
 
