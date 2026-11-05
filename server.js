@@ -46,6 +46,7 @@ io.on('connection', (socket) => {
             config: config,
             players: [],
             status: 'lobby',
+            meetingActive: false,
             taskTotal: 0,
             tasksDone: 0
         };
@@ -97,6 +98,7 @@ io.on('connection', (socket) => {
         // Send updated player list to EVERYONE in the room (including host)
         io.to(roomCode).emit('update_player_list', getPlayerList(game));
         broadcastGameUpdate(roomCode, `${player.name} joined`);
+        socket.emit('meeting:state', { active: game.meetingActive });
 
         if (game.status === 'playing' && player.role && player.tasks) {
             socket.emit('game_started', {
@@ -133,6 +135,7 @@ io.on('connection', (socket) => {
 
         game.taskTotal = 0;
         game.tasksDone = 0;
+        game.meetingActive = false;
 
         // 1. Shuffle players and determine how many impostors to assign
         const shuffledPlayers = shuffle([...players]);
@@ -164,8 +167,35 @@ io.on('connection', (socket) => {
         // 3. Update game status and notify host
         game.status = 'playing';
         io.to(roomCode).emit('host_game_started');
+        io.to(roomCode).emit('meeting:state', { active: game.meetingActive });
         broadcastGameUpdate(roomCode, 'Game started');
         console.log(`Game started in room ${roomCode} with ${impostorCount} impostors.`);
+    });
+
+    socket.on('player:emergency_meeting', () => {
+        const gameEntry = Object.entries(activeGames).find(([, game]) =>
+            game.players.some(player => player.id === socket.id)
+        );
+        if (!gameEntry) return;
+
+        const [roomCode, game] = gameEntry;
+        if (game.status !== 'playing' || game.meetingActive) return;
+
+        game.meetingActive = true;
+        io.to(roomCode).emit('meeting:state', { active: true });
+        broadcastGameUpdate(roomCode, 'Emergency meeting called');
+    });
+
+    socket.on('host:meeting_toggle', ({ roomCode }) => {
+        const game = activeGames[roomCode];
+        if (!game || game.hostId !== socket.id || game.status !== 'playing') return;
+
+        game.meetingActive = !game.meetingActive;
+        io.to(roomCode).emit('meeting:state', { active: game.meetingActive });
+        broadcastGameUpdate(
+            roomCode,
+            game.meetingActive ? 'Emergency meeting called by host' : 'Emergency meeting ended'
+        );
     });
 
     socket.on('task:completed', (data) => {
@@ -206,6 +236,8 @@ io.on('connection', (socket) => {
 function endGame(roomCode) {
     console.log(`Game ended in room ${roomCode}`);
 }
+
+
 
 // 4. Start the server on port 3000
 const PORT = 80;
