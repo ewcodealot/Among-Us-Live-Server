@@ -33,6 +33,38 @@ function getPlayerList(game) {
     return getConnectedPlayers(game).map(({ id, name }) => ({ id, name }));
 }
 
+function getGamePlayerState(game, viewer) {
+    return game.players.map(({ id, name, dead, connected }) => ({
+        id: id ?? null,
+        name,
+        dead: dead === true,
+        connected: connected === true,
+        canBeKilled: viewer.role === 'Impostor' &&
+            game.players.find(player => player.id === id)?.role === 'Crewmate' &&
+            dead !== true
+    }));
+}
+
+function sendPlayerState(game, viewer) {
+    io.to(viewer.id).emit('players:state', {
+        playerId: viewer.id,
+        players: getGamePlayerState(game, viewer)
+    });
+}
+
+function sendPlayerStates(game) {
+    getConnectedPlayers(game).forEach(player => sendPlayerState(game, player));
+}
+
+function reportDeathsAtMeeting(game) {
+    if (game.pendingDeaths.length === 0) return;
+
+    io.to(game.hostId).emit('game:update', {
+        message: `Died before the meeting: ${game.pendingDeaths.join(', ')}`
+    });
+    game.pendingDeaths = [];
+}
+
 function broadcastGameUpdate(roomCode, message) {
     io.to(roomCode).emit('game:update', { message });
 }
@@ -48,7 +80,8 @@ io.on('connection', (socket) => {
             status: 'lobby',
             meetingActive: false,
             taskTotal: 0,
-            tasksDone: 0
+            tasksDone: 0,
+            pendingDeaths: []
         };
 
         socket.join(roomCode);
@@ -84,12 +117,13 @@ io.on('connection', (socket) => {
         }
 
         if (!player) {
-            player = { name: playerName, role: null, tasks: null };
+            player = { name: playerName, role: null, tasks: null, dead: false };
             game.players.push(player);
         }
 
         player.id = socket.id;
         player.connected = true;
+        player.dead = player.dead === true;
         socket.join(roomCode);
 
         // Tell player they joined successfully
@@ -105,6 +139,7 @@ io.on('connection', (socket) => {
                 role: player.role,
                 tasks: player.tasks
             });
+            sendPlayerState(game, player);
         }
 
         console.log(`${player.name} joined room ${roomCode}`);
@@ -136,6 +171,7 @@ io.on('connection', (socket) => {
         game.taskTotal = 0;
         game.tasksDone = 0;
         game.meetingActive = false;
+        game.pendingDeaths = [];
 
         // 1. Shuffle players and determine how many impostors to assign
         const shuffledPlayers = shuffle([...players]);
@@ -152,7 +188,9 @@ io.on('connection', (socket) => {
             assignedTasks = shuffle(allTasks.map(task => ({ ...task, completed: false }))).slice(0, 5);
 
             player.role = isImpostor ? 'Impostor' : 'Crewmate';
+            player.team = player.role;
             player.tasks = assignedTasks;
+            player.dead = false;
             if (!isImpostor) {
                 game.taskTotal += assignedTasks.length;
             }
@@ -166,6 +204,7 @@ io.on('connection', (socket) => {
 
         // 3. Update game status and notify host
         game.status = 'playing';
+        sendPlayerStates(game);
         io.to(roomCode).emit('host_game_started');
         io.to(roomCode).emit('meeting:state', { active: game.meetingActive });
         broadcastGameUpdate(roomCode, 'Game started');
@@ -179,11 +218,15 @@ io.on('connection', (socket) => {
         if (!gameEntry) return;
 
         const [roomCode, game] = gameEntry;
+        const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
+        if (!player || player.dead) return;
         if (game.status !== 'playing' || game.meetingActive) return;
 
         game.meetingActive = true;
         io.to(roomCode).emit('meeting:state', { active: true });
+        sendPlayerStates(game);
         broadcastGameUpdate(roomCode, 'Emergency meeting called');
+        reportDeathsAtMeeting(game);
     });
 
     socket.on('host:meeting_toggle', ({ roomCode }) => {
@@ -192,10 +235,55 @@ io.on('connection', (socket) => {
 
         game.meetingActive = !game.meetingActive;
         io.to(roomCode).emit('meeting:state', { active: game.meetingActive });
+        if (game.meetingActive) {
+            sendPlayerStates(game);
+            reportDeathsAtMeeting(game);
+        }
         broadcastGameUpdate(
             roomCode,
             game.meetingActive ? 'Emergency meeting called by host' : 'Emergency meeting ended'
         );
+    });
+
+    socket.on('player:kill_player', ({ targetId } = {}) => {
+        const gameEntry = Object.entries(activeGames).find(([, game]) =>
+            game.players.some(player => player.id === socket.id)
+        );
+        if (!gameEntry) {
+            socket.emit('player:kill_result', {
+                success: false,
+                message: 'You are not in an active game.'
+            });
+            return;
+        }
+
+        const [, game] = gameEntry;
+        const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
+        const target = game.players.find(existingPlayer => existingPlayer.id === targetId);
+
+        if (game.status !== 'playing' || game.meetingActive ||
+            !player || player.role !== 'Impostor' || player.dead) {
+            socket.emit('player:kill_result', {
+                success: false,
+                message: 'You cannot kill a player right now.'
+            });
+            return;
+        }
+
+        if (!target || target === player || !target.connected ||
+            target.dead || target.role !== 'Crewmate') {
+            socket.emit('player:kill_result', {
+                success: false,
+                message: 'That player is not available to kill.'
+            });
+            return;
+        }
+
+        target.dead = true;
+        target.role = 'Dead';
+        game.pendingDeaths.push(target.name);
+        io.to(target.id).emit('player:died');
+        socket.emit('player:kill_result', { success: true });
     });
 
     socket.on('task:completed', (data) => {
@@ -213,7 +301,7 @@ io.on('connection', (socket) => {
         if (!task || task.completed) return;
 
         task.completed = true;
-        if (player.role === 'Crewmate') {
+        if (player.team === 'Crewmate' || player.role === 'Crewmate') {
             game.tasksDone++;
         }
         console.log(`${player.name} completed task ${task.title}`);
