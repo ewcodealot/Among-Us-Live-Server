@@ -3,6 +3,9 @@ const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
 
+const frontendPath = path.join(__dirname, '../Among-Us-Live-Mobile-System');
+const defaultConfig = require(path.join(frontendPath, 'System', 'defaultconfig.json'));
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -13,9 +16,9 @@ const io = new Server(server, {
 });
 
 // 1. Serve all static files from frontend folder
-app.use(express.static(path.join(__dirname, '../Among-Us-Live-Mobile-System')));
+app.use(express.static(frontendPath));
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, '../Among-Us-Live-Mobile-System', 'index.html'));
+    res.sendFile(path.join(frontendPath, 'index.html'));
 });
 
 // 3. Socket.io Real-time Communication
@@ -69,19 +72,57 @@ function broadcastGameUpdate(roomCode, message) {
     io.to(roomCode).emit('game:update', { message });
 }
 
+function isValidGameConfig(config) {
+    return config &&
+        typeof config === 'object' &&
+        config.gameSettings &&
+        Number.isInteger(config.gameSettings.impostorCount) &&
+        config.gameSettings.impostorCount >= 0 &&
+        Array.isArray(config.tasks) &&
+        config.tasks.every(task =>
+            task && typeof task.id === 'string' &&
+            typeof task.title === 'string' &&
+            typeof task.description === 'string' &&
+            typeof task.hint === 'string'
+        ) &&
+        Array.isArray(config.sabotages) &&
+        config.sabotages.every(sabotage =>
+            sabotage && typeof sabotage.id === 'string' &&
+            typeof sabotage.title === 'string' &&
+            typeof sabotage.description === 'string'
+        );
+}
+
 io.on('connection', (socket) => {
 
     // Host creates game
-    socket.on('host:create_game', ({ roomCode, config }) => {
+    socket.on('host:create_game', (data = {}) => {
+        const roomCode = typeof data.roomCode === 'string' ? data.roomCode.trim().toUpperCase() : '';
+        const config = data.config ?? defaultConfig;
+
+        if (!roomCode) {
+            socket.emit('error_message', 'Please enter a room code.');
+            return;
+        }
+        if (activeGames[roomCode]) {
+            socket.emit('error_message', 'That room code is already in use.');
+            return;
+        }
+        if (!isValidGameConfig(config)) {
+            socket.emit('error_message', 'Invalid game configuration. Check the settings, tasks, and sabotages.');
+            return;
+        }
+
         activeGames[roomCode] = {
             hostId: socket.id,
-            config: config,
+            config,
             players: [],
             status: 'lobby',
             meetingActive: false,
             taskTotal: 0,
             tasksDone: 0,
-            pendingDeaths: []
+            pendingDeaths: [],
+            activeSabotage: null
         };
 
         socket.join(roomCode);
@@ -137,7 +178,8 @@ io.on('connection', (socket) => {
         if (game.status === 'playing' && player.role && player.tasks) {
             socket.emit('game_started', {
                 role: player.role,
-                tasks: player.tasks
+                tasks: player.tasks,
+                sabotages: game.config.sabotages
             });
             sendPlayerState(game, player);
         }
@@ -162,7 +204,7 @@ io.on('connection', (socket) => {
 
     socket.on('host:start_game', ({ roomCode }) => {
         const game = activeGames[roomCode];
-        if (!game) return;
+        if (!game || game.hostId !== socket.id || game.status !== 'lobby') return;
 
         const players = getConnectedPlayers(game);
         const settings = game.config.gameSettings;
@@ -172,6 +214,7 @@ io.on('connection', (socket) => {
         game.tasksDone = 0;
         game.meetingActive = false;
         game.pendingDeaths = [];
+        game.activeSabotage = null;
 
         // 1. Shuffle players and determine how many impostors to assign
         const shuffledPlayers = shuffle([...players]);
@@ -183,9 +226,7 @@ io.on('connection', (socket) => {
         shuffledPlayers.forEach((player, index) => {
             const isImpostor = index < impostorCount;
             
-            let assignedTasks = [];
-            // Give each crewmate a randomized subset of 3 tasks from the config file
-            assignedTasks = shuffle(allTasks.map(task => ({ ...task, completed: false }))).slice(0, 5);
+            const assignedTasks = shuffle(allTasks.map(task => ({ ...task, completed: false }))).slice(0, 5);
 
             player.role = isImpostor ? 'Impostor' : 'Crewmate';
             player.team = player.role;
@@ -198,7 +239,8 @@ io.on('connection', (socket) => {
             // Send private role and task data directly to that specific player's socket
             io.to(player.id).emit('game_started', {
                 role: player.role,
-                tasks: assignedTasks
+                tasks: assignedTasks,
+                sabotages: game.config.sabotages
             });
         });
 
@@ -207,6 +249,7 @@ io.on('connection', (socket) => {
         sendPlayerStates(game);
         io.to(roomCode).emit('host_game_started');
         io.to(roomCode).emit('meeting:state', { active: game.meetingActive });
+        io.to(roomCode).emit('sabotage:state', { active: false });
         broadcastGameUpdate(roomCode, 'Game started');
         console.log(`Game started in room ${roomCode} with ${impostorCount} impostors.`);
     });
@@ -243,6 +286,17 @@ io.on('connection', (socket) => {
             roomCode,
             game.meetingActive ? 'Emergency meeting called by host' : 'Emergency meeting ended'
         );
+    });
+
+    socket.on('host:complete_sabotage', ({ roomCode } = {}) => {
+        const game = activeGames[roomCode];
+        if (!game || game.hostId !== socket.id || game.status !== 'playing' || !game.activeSabotage) return;
+
+        const { title } = game.activeSabotage;
+        game.activeSabotage = null;
+        io.to(roomCode).emit('sabotage:completed', { title });
+        io.to(roomCode).emit('sabotage:state', { active: false });
+        broadcastGameUpdate(roomCode, `Sabotage completed: ${title}`);
     });
 
     socket.on('player:kill_player', ({ targetId } = {}) => {
@@ -284,6 +338,57 @@ io.on('connection', (socket) => {
         game.pendingDeaths.push(target.name);
         io.to(target.id).emit('player:died');
         socket.emit('player:kill_result', { success: true });
+    });
+
+    socket.on('player:sabotage', ({ sabotageId } = {}) => {
+        const gameEntry = Object.entries(activeGames).find(([, game]) =>
+            game.players.some(player => player.id === socket.id)
+        );
+        if (!gameEntry) {
+            socket.emit('player:sabotage_result', {
+                success: false,
+                message: 'You are not in an active game.'
+            });
+            return;
+        }
+
+        const [roomCode, game] = gameEntry;
+        const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
+        const sabotage = game.config.sabotages.find(item => item.id === sabotageId);
+
+        if (game.status !== 'playing' || game.meetingActive ||
+            !player || player.role !== 'Impostor' || player.dead) {
+            socket.emit('player:sabotage_result', {
+                success: false,
+                message: 'You cannot trigger a sabotage right now.'
+            });
+            return;
+        }
+
+        if (!sabotage) {
+            socket.emit('player:sabotage_result', {
+                success: false,
+                message: 'That sabotage is not available.'
+            });
+            return;
+        }
+
+        if (game.activeSabotage) {
+            socket.emit('player:sabotage_result', {
+                success: false,
+                message: 'A sabotage is already active.'
+            });
+            return;
+        }
+
+        game.activeSabotage = sabotage;
+        io.to(roomCode).emit('sabotage:started', {
+            title: sabotage.title,
+            description: sabotage.description
+        });
+        io.to(roomCode).emit('sabotage:state', { active: true, title: sabotage.title });
+        broadcastGameUpdate(roomCode, `Sabotage triggered: ${sabotage.title}`);
+        socket.emit('player:sabotage_result', { success: true });
     });
 
     socket.on('task:completed', (data) => {
