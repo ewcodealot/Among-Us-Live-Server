@@ -32,14 +32,24 @@ function getConnectedPlayers(game) {
     return game.players.filter(player => player.connected);
 }
 
+function isValidPlayerColor(color) {
+    return typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color);
+}
+
+function randomPlayerColor() {
+    const channel = () => Math.floor(128 + Math.random() * 128).toString(16).padStart(2, '0');
+    return `#${channel()}${channel()}${channel()}`;
+}
+
 function getPlayerList(game) {
-    return getConnectedPlayers(game).map(({ id, name }) => ({ id, name }));
+    return getConnectedPlayers(game).map(({ id, name, color }) => ({ id, name, color }));
 }
 
 function getGamePlayerState(game, viewer) {
-    return game.players.map(({ id, name, dead, connected }) => ({
+    return game.players.map(({ id, name, color, dead, connected }) => ({
         id: id ?? null,
         name,
+        color,
         dead: dead === true,
         connected: connected === true,
         canBeKilled: viewer.role === 'Impostor' &&
@@ -135,6 +145,7 @@ io.on('connection', (socket) => {
     socket.on('player:join_game', (data) => {
         const roomCode = typeof data?.roomCode === 'string' ? data.roomCode.trim().toUpperCase() : '';
         const playerName = typeof data?.playerName === 'string' ? data.playerName.trim() : '';
+        const requestedColor = isValidPlayerColor(data?.playerColor) ? data.playerColor : null;
 
         if (!roomCode || !playerName) {
             socket.emit('error_message', 'Please enter a name and room code!');
@@ -158,8 +169,16 @@ io.on('connection', (socket) => {
         }
 
         if (!player) {
-            player = { name: playerName, role: null, tasks: null, dead: false };
+            player = {
+                name: playerName,
+                color: requestedColor || randomPlayerColor(),
+                role: null,
+                tasks: null,
+                dead: false
+            };
             game.players.push(player);
+        } else if (!isValidPlayerColor(player.color)) {
+            player.color = requestedColor || randomPlayerColor();
         }
 
         player.id = socket.id;
@@ -168,7 +187,7 @@ io.on('connection', (socket) => {
         socket.join(roomCode);
 
         // Tell player they joined successfully
-        socket.emit('join_success', { roomCode });
+        socket.emit('join_success', { roomCode, color: player.color, status: game.status });
 
         // Send updated player list to EVERYONE in the room (including host)
         io.to(roomCode).emit('update_player_list', getPlayerList(game));
@@ -185,6 +204,26 @@ io.on('connection', (socket) => {
         }
 
         console.log(`${player.name} joined room ${roomCode}`);
+    });
+
+    socket.on('player:update_color', (data) => {
+        const color = data?.color;
+        if (!isValidPlayerColor(color)) {
+            socket.emit('error_message', 'Please select a valid player color.');
+            return;
+        }
+
+        const gameEntry = Object.entries(activeGames).find(([, game]) =>
+            game.players.some(player => player.id === socket.id)
+        );
+        if (!gameEntry) return;
+
+        const [roomCode, game] = gameEntry;
+        const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
+        if (!player || game.status !== 'lobby') return;
+
+        player.color = color;
+        io.to(roomCode).emit('update_player_list', getPlayerList(game));
     });
 
     socket.on('disconnect', () => {
