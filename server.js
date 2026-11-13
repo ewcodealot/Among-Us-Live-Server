@@ -2,6 +2,10 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const {
+    isValidPlayerColor,
+    randomPlayerColor
+} = require(path.join(__dirname, '../Among-Us-Live-Mobile-System/System/player-colors.js'));
 
 const frontendPath = path.join(__dirname, '../Among-Us-Live-Mobile-System');
 const defaultConfig = require(path.join(frontendPath, 'System', 'defaultconfig.json'));
@@ -32,15 +36,6 @@ function getConnectedPlayers(game) {
     return game.players.filter(player => player.connected);
 }
 
-function isValidPlayerColor(color) {
-    return typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color);
-}
-
-function randomPlayerColor() {
-    const channel = () => Math.floor(128 + Math.random() * 128).toString(16).padStart(2, '0');
-    return `#${channel()}${channel()}${channel()}`;
-}
-
 function getPlayerList(game) {
     return getConnectedPlayers(game).map(({ id, name, color }) => ({ id, name, color }));
 }
@@ -67,6 +62,33 @@ function sendPlayerState(game, viewer) {
 
 function sendPlayerStates(game) {
     getConnectedPlayers(game).forEach(player => sendPlayerState(game, player));
+}
+
+function getVotingResults(game) {
+    const players = game.players.map(player => ({
+        name: player.name,
+        votes: game.votes.filter(vote => vote.targetName === player.name).length
+    }));
+    const skipVotes = game.votes.filter(vote => vote.targetName === null).length;
+    const maxVotes = Math.max(0, ...players.map(player => player.votes));
+    const tiedPlayers = players.filter(player => maxVotes > 0 && player.votes === maxVotes);
+    const skipTied = maxVotes > 0 && skipVotes === maxVotes;
+    const tied = tiedPlayers.length > 1 || (tiedPlayers.length === 1 && skipTied);
+    const eliminated = !tied && tiedPlayers.length === 1 && tiedPlayers[0].votes > skipVotes
+        ? game.players.find(player => player.name === tiedPlayers[0].name)
+        : null;
+
+    return {
+        players: players.map(player => ({
+            ...player,
+            tied: tied && player.votes === maxVotes
+        })),
+        skipVotes,
+        maxVotes,
+        skipTied,
+        tied,
+        eliminatedName: eliminated?.name ?? null
+    };
 }
 
 function reportDeathsAtMeeting(game) {
@@ -129,6 +151,16 @@ io.on('connection', (socket) => {
             players: [],
             status: 'lobby',
             meetingActive: false,
+            votingActive: false,
+            resultsActive: false,
+            votes: [],
+            voteResults: null,
+            resultsStartedAt: 0,
+            resultsReadyAt: 0,
+            ejectedPlayer: null,
+            meetingType: null,
+            meetingReporter: null,
+            meetingBodyName: null,
             taskTotal: 0,
             tasksDone: 0,
             pendingDeaths: [],
@@ -192,15 +224,46 @@ io.on('connection', (socket) => {
         // Send updated player list to EVERYONE in the room (including host)
         io.to(roomCode).emit('update_player_list', getPlayerList(game));
         broadcastGameUpdate(roomCode, `${player.name} joined`);
-        socket.emit('meeting:state', { active: game.meetingActive });
-
         if (game.status === 'playing' && player.role && player.tasks) {
             socket.emit('game_started', {
                 role: player.role,
+                team: player.team,
                 tasks: player.tasks,
                 sabotages: game.config.sabotages
             });
             sendPlayerState(game, player);
+            if (player.votedOut) {
+                socket.emit('player:voted_out', { role: player.team });
+            }
+        }
+        socket.emit('meeting:state', {
+            active: game.meetingActive,
+            phase: game.meetingActive
+                ? 'meeting'
+                : game.votingActive
+                    ? 'voting'
+                    : game.resultsActive
+                        ? 'results'
+                        : 'none',
+            type: game.meetingType,
+            reporterName: game.meetingReporter,
+            bodyName: game.meetingBodyName
+        });
+        if (game.votingActive) {
+            const playerVote = game.votes.find(vote => vote.voterName === player.name);
+            socket.emit('player:vote_status', {
+                hasVoted: Boolean(playerVote),
+                votedFor: playerVote
+                    ? playerVote.targetName === null
+                        ? 'skip'
+                        : game.players.find(target => target.name === playerVote.targetName)?.id ?? null
+                    : null
+            });
+        } else if (game.resultsActive && game.voteResults) {
+            socket.emit('voting:results', {
+                ...game.voteResults,
+                revealElapsedMs: Date.now() - game.resultsStartedAt
+            });
         }
 
         console.log(`${player.name} joined room ${roomCode}`);
@@ -209,7 +272,7 @@ io.on('connection', (socket) => {
     socket.on('player:update_color', (data) => {
         const color = data?.color;
         if (!isValidPlayerColor(color)) {
-            socket.emit('error_message', 'Please select a valid player color.');
+            socket.emit('error_message', 'Please select a valid, darker player color.');
             return;
         }
 
@@ -252,6 +315,16 @@ io.on('connection', (socket) => {
         game.taskTotal = 0;
         game.tasksDone = 0;
         game.meetingActive = false;
+        game.votingActive = false;
+        game.resultsActive = false;
+        game.votes = [];
+        game.voteResults = null;
+        game.resultsStartedAt = 0;
+        game.resultsReadyAt = 0;
+        game.ejectedPlayer = null;
+        game.meetingType = null;
+        game.meetingReporter = null;
+        game.meetingBodyName = null;
         game.pendingDeaths = [];
         game.activeSabotage = null;
 
@@ -271,6 +344,8 @@ io.on('connection', (socket) => {
             player.team = player.role;
             player.tasks = assignedTasks;
             player.dead = false;
+            player.votedOut = false;
+            player.bodyReported = false;
             if (!isImpostor) {
                 game.taskTotal += assignedTasks.length;
             }
@@ -278,6 +353,7 @@ io.on('connection', (socket) => {
             // Send private role and task data directly to that specific player's socket
             io.to(player.id).emit('game_started', {
                 role: player.role,
+                team: player.team,
                 tasks: assignedTasks,
                 sabotages: game.config.sabotages
             });
@@ -287,7 +363,7 @@ io.on('connection', (socket) => {
         game.status = 'playing';
         sendPlayerStates(game);
         io.to(roomCode).emit('host_game_started');
-        io.to(roomCode).emit('meeting:state', { active: game.meetingActive });
+        io.to(roomCode).emit('meeting:state', { active: false, phase: 'none' });
         io.to(roomCode).emit('sabotage:state', { active: false });
         broadcastGameUpdate(roomCode, 'Game started');
         console.log(`Game started in room ${roomCode} with ${impostorCount} impostors.`);
@@ -302,10 +378,24 @@ io.on('connection', (socket) => {
         const [roomCode, game] = gameEntry;
         const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
         if (!player || player.dead) return;
-        if (game.status !== 'playing' || game.meetingActive) return;
+        if (game.status !== 'playing' || game.meetingActive || game.votingActive || game.resultsActive) return;
 
         game.meetingActive = true;
-        io.to(roomCode).emit('meeting:state', { active: true });
+        game.votingActive = false;
+        game.resultsActive = false;
+        game.votes = [];
+        game.voteResults = null;
+        game.resultsStartedAt = 0;
+        game.resultsReadyAt = 0;
+        game.ejectedPlayer = null;
+        game.meetingType = 'emergency';
+        game.meetingReporter = null;
+        game.meetingBodyName = null;
+        io.to(roomCode).emit('meeting:state', {
+            active: true,
+            phase: 'meeting',
+            type: game.meetingType
+        });
         sendPlayerStates(game);
         broadcastGameUpdate(roomCode, 'Emergency meeting called');
         reportDeathsAtMeeting(game);
@@ -315,16 +405,145 @@ io.on('connection', (socket) => {
         const game = activeGames[roomCode];
         if (!game || game.hostId !== socket.id || game.status !== 'playing') return;
 
-        game.meetingActive = !game.meetingActive;
-        io.to(roomCode).emit('meeting:state', { active: game.meetingActive });
+        if (game.meetingActive) {
+            game.meetingActive = false;
+            game.votingActive = true;
+            game.votes = [];
+            game.voteResults = null;
+            game.resultsStartedAt = 0;
+            game.resultsReadyAt = 0;
+            game.ejectedPlayer = null;
+        } else if (game.votingActive) {
+            game.votingActive = false;
+            game.resultsActive = true;
+            game.resultsStartedAt = Date.now();
+            game.voteResults = {
+                ...getVotingResults(game),
+                revealElapsedMs: 0,
+                revealIntervalMs: 2000
+            };
+            game.ejectedPlayer = game.voteResults.eliminatedName
+                ? game.players.find(player => player.name === game.voteResults.eliminatedName)
+                : null;
+            if (game.ejectedPlayer) {
+                game.ejectedPlayer.dead = true;
+                game.ejectedPlayer.role = 'Dead';
+            }
+            game.resultsReadyAt = game.resultsStartedAt +
+                Math.max(0, game.voteResults.players.length) * game.voteResults.revealIntervalMs;
+        } else if (game.resultsActive) {
+            if (Date.now() < game.resultsReadyAt) return;
+
+            const ejectedPlayer = game.ejectedPlayer;
+            const ejectedRole = ejectedPlayer?.team;
+            if (ejectedPlayer) ejectedPlayer.votedOut = true;
+            game.resultsActive = false;
+            game.voteResults = null;
+            game.resultsStartedAt = 0;
+            game.resultsReadyAt = 0;
+            game.ejectedPlayer = null;
+            game.meetingType = null;
+            game.meetingReporter = null;
+            game.meetingBodyName = null;
+            if (ejectedPlayer?.connected && ejectedRole) {
+                io.to(ejectedPlayer.id).emit('player:voted_out', { role: ejectedRole });
+            }
+        } else {
+            game.meetingActive = true;
+            game.votingActive = false;
+            game.resultsActive = false;
+            game.votes = [];
+            game.voteResults = null;
+            game.resultsStartedAt = 0;
+            game.resultsReadyAt = 0;
+            game.ejectedPlayer = null;
+            game.meetingType = 'emergency';
+            game.meetingReporter = null;
+            game.meetingBodyName = null;
+        }
+        io.to(roomCode).emit('meeting:state', {
+            active: game.meetingActive,
+            phase: game.meetingActive
+                ? 'meeting'
+                : game.votingActive
+                    ? 'voting'
+                    : game.resultsActive
+                        ? 'results'
+                        : 'none',
+            type: game.meetingType
+        });
         if (game.meetingActive) {
             sendPlayerStates(game);
             reportDeathsAtMeeting(game);
+        } else if (game.resultsActive) {
+            sendPlayerStates(game);
+            io.to(roomCode).emit('voting:results', {
+                ...game.voteResults,
+                revealElapsedMs: 0
+            });
+        } else if (!game.votingActive) {
+            sendPlayerStates(game);
         }
-        broadcastGameUpdate(
-            roomCode,
-            game.meetingActive ? 'Emergency meeting called by host' : 'Emergency meeting ended'
+        const updateMessage = game.meetingActive
+            ? 'Emergency meeting called by host'
+            : game.votingActive
+                ? 'Voting started'
+                : game.resultsActive
+                    ? 'Voting ended; results are being revealed'
+                    : 'Voting results cleared';
+        broadcastGameUpdate(roomCode, updateMessage);
+    });
+
+    socket.on('player:cast_vote', ({ targetId, skip } = {}) => {
+        const game = Object.values(activeGames).find(candidate =>
+            candidate.players.some(player => player.id === socket.id)
         );
+        if (!game) {
+            socket.emit('player:vote_result', {
+                success: false,
+                message: 'You are not in an active game.'
+            });
+            return;
+        }
+
+        const voter = game.players.find(player => player.id === socket.id);
+        if (game.status !== 'playing' || !game.votingActive || !voter || voter.dead) {
+            socket.emit('player:vote_result', {
+                success: false,
+                message: 'You cannot vote right now.'
+            });
+            return;
+        }
+
+        if (game.votes.some(vote => vote.voterName === voter.name)) {
+            socket.emit('player:vote_result', {
+                success: false,
+                message: 'You have already voted.'
+            });
+            return;
+        }
+
+        let targetName = null;
+        if (skip !== true) {
+            const target = game.players.find(player =>
+                player.id === targetId && player.connected && !player.dead
+            );
+            if (!target || target === voter) {
+                socket.emit('player:vote_result', {
+                    success: false,
+                    message: 'That player is not available to vote for.'
+                });
+                return;
+            }
+            targetName = target.name;
+        }
+
+        game.votes.push({ voterName: voter.name, targetName });
+        const votedFor = targetName === null
+            ? 'skip'
+            : game.players.find(player => player.name === targetName).id;
+        socket.emit('player:vote_result', { success: true, votedFor });
+        socket.emit('player:vote_status', { hasVoted: true, votedFor });
     });
 
     socket.on('host:complete_sabotage', ({ roomCode } = {}) => {
@@ -336,6 +555,84 @@ io.on('connection', (socket) => {
         io.to(roomCode).emit('sabotage:completed', { title });
         io.to(roomCode).emit('sabotage:state', { active: false });
         broadcastGameUpdate(roomCode, `Sabotage completed: ${title}`);
+    });
+
+    socket.on('player:report_body', ({ targetName } = {}) => {
+        const gameEntry = Object.entries(activeGames).find(([, game]) =>
+            game.players.some(player => player.id === socket.id)
+        );
+        if (!gameEntry) {
+            socket.emit('player:report_result', {
+                success: false,
+                message: 'You are not in an active game.'
+            });
+            return;
+        }
+
+        const [roomCode, game] = gameEntry;
+        const reporter = game.players.find(existingPlayer => existingPlayer.id === socket.id);
+        const target = typeof targetName === 'string'
+            ? game.players.find(existingPlayer =>
+                existingPlayer.name.toLowerCase() === targetName.trim().toLowerCase()
+            )
+            : null;
+
+        if (game.status !== 'playing' || game.meetingActive || game.votingActive || game.resultsActive ||
+            !reporter || reporter.dead) {
+            socket.emit('player:report_result', {
+                success: false,
+                message: 'You cannot report a body right now.'
+            });
+            return;
+        }
+
+        if (!target || target === reporter) {
+            socket.emit('player:report_result', {
+                success: false,
+                message: 'That player is not available to report.'
+            });
+            return;
+        }
+
+        if (!target.dead) {
+            socket.emit('player:report_result', {
+                success: false,
+                message: 'That player is not dead.'
+            });
+            return;
+        }
+
+        if (target.bodyReported) {
+            socket.emit('player:report_result', {
+                success: false,
+                message: 'That body has already been reported.'
+            });
+            return;
+        }
+
+        target.bodyReported = true;
+        game.meetingActive = true;
+        game.votingActive = false;
+        game.resultsActive = false;
+        game.votes = [];
+        game.voteResults = null;
+        game.resultsStartedAt = 0;
+        game.resultsReadyAt = 0;
+        game.ejectedPlayer = null;
+        game.meetingType = 'body_found';
+        game.meetingReporter = reporter.name;
+        game.meetingBodyName = target.name;
+        io.to(roomCode).emit('meeting:state', {
+            active: true,
+            phase: 'meeting',
+            type: game.meetingType,
+            reporterName: reporter.name,
+            bodyName: target.name
+        });
+        sendPlayerStates(game);
+        broadcastGameUpdate(roomCode, `${reporter.name} found ${target.name}'s body`);
+        reportDeathsAtMeeting(game);
+        socket.emit('player:report_result', { success: true });
     });
 
     socket.on('player:kill_player', ({ targetId } = {}) => {
@@ -354,7 +651,7 @@ io.on('connection', (socket) => {
         const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
         const target = game.players.find(existingPlayer => existingPlayer.id === targetId);
 
-        if (game.status !== 'playing' || game.meetingActive ||
+        if (game.status !== 'playing' || game.meetingActive || game.votingActive || game.resultsActive ||
             !player || player.role !== 'Impostor' || player.dead) {
             socket.emit('player:kill_result', {
                 success: false,
@@ -375,7 +672,7 @@ io.on('connection', (socket) => {
         target.dead = true;
         target.role = 'Dead';
         game.pendingDeaths.push(target.name);
-        io.to(target.id).emit('player:died');
+        io.to(target.id).emit('player:died', { team: target.team });
         socket.emit('player:kill_result', { success: true });
     });
 
@@ -395,8 +692,8 @@ io.on('connection', (socket) => {
         const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
         const sabotage = game.config.sabotages.find(item => item.id === sabotageId);
 
-        if (game.status !== 'playing' || game.meetingActive ||
-            !player || player.role !== 'Impostor' || player.dead) {
+        if (game.status !== 'playing' || game.meetingActive || game.votingActive || game.resultsActive ||
+            !player || player.team !== 'Impostor') {
             socket.emit('player:sabotage_result', {
                 success: false,
                 message: 'You cannot trigger a sabotage right now.'
