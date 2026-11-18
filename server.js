@@ -3,12 +3,13 @@ const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
 const {
-    isValidPlayerColor,
-    randomPlayerColor
+    getDistinctPlayerColor,
+    isValidPlayerColor
 } = require(path.join(__dirname, '../Among-Us-Live-Mobile-System/System/player-colors.js'));
 
 const frontendPath = path.join(__dirname, '../Among-Us-Live-Mobile-System');
 const defaultConfig = require(path.join(frontendPath, 'System', 'defaultconfig.json'));
+const INACTIVE_PLAYER_GRACE_MS = 3 * 60 * 1000;
 
 const app = express();
 const server = http.createServer(app);
@@ -34,6 +35,25 @@ function shuffle(array) {
 
 function getConnectedPlayers(game) {
     return game.players.filter(player => player.connected);
+}
+
+function getIncludedPlayers(game, now = Date.now()) {
+    return game.players.filter(player =>
+        player.connected ||
+        (Number.isFinite(player.disconnectedAt) &&
+            now - player.disconnectedAt < INACTIVE_PLAYER_GRACE_MS)
+    );
+}
+
+function getTaskProgress(game) {
+    const crewmates = getIncludedPlayers(game).filter(player => player.team === 'Crewmate');
+    const tasks = crewmates.flatMap(player => Array.isArray(player.tasks) ? player.tasks : []);
+
+    return {
+        total: tasks.length,
+        completed: tasks.filter(task => task.completed).length,
+        crewmates
+    };
 }
 
 function getPlayerList(game) {
@@ -101,7 +121,100 @@ function reportDeathsAtMeeting(game) {
 }
 
 function broadcastGameUpdate(roomCode, message) {
+    const game = activeGames[roomCode];
+    if (game?.activityLog) {
+        game.activityLog.push({
+            timestamp: new Date().toISOString(),
+            message
+        });
+    }
     io.to(roomCode).emit('game:update', { message });
+}
+
+function getGameAnalytics(game, roomCode) {
+    const participants = game.players.filter(player =>
+        player.team === 'Crewmate' || player.team === 'Impostor'
+    );
+
+    return {
+        roomCode,
+        startedAt: new Date(game.startedAt).toISOString(),
+        endedAt: new Date(game.endedAt).toISOString(),
+        durationMs: game.endedAt - game.startedAt,
+        winner: game.endResult.winner,
+        endReason: game.endResult.reason,
+        playerCount: participants.length,
+        totalVotes: game.voteHistory.reduce((total, meeting) => total + meeting.votes.length, 0),
+        players: game.players.map(player => ({
+            name: player.name,
+            role: player.team || 'Not assigned',
+            connected: player.connected === true,
+            dead: player.dead === true,
+            votedOut: player.votedOut === true,
+            tasksCompleted: Array.isArray(player.tasks)
+                ? player.tasks.filter(task => task.completed).length
+                : 0,
+            taskCount: Array.isArray(player.tasks) ? player.tasks.length : 0
+        })),
+        voteHistory: game.voteHistory,
+        killHistory: game.killHistory,
+        activityLog: game.activityLog
+    };
+}
+
+function checkGameEnd(roomCode, game) {
+    if (game.status !== 'playing') return;
+
+    const { total, completed, crewmates } = getTaskProgress(game);
+    if (crewmates.length > 0 && total > 0 && completed === total) {
+        endGame(roomCode, game, {
+            winner: 'Crewmates',
+            reason: 'tasks',
+            title: 'Crewmates Win!',
+            message: 'All active crewmates completed their tasks.'
+        });
+        return;
+    }
+
+    const impostors = game.players.filter(player => player.team === 'Impostor');
+    if (impostors.length > 0 && impostors.every(player => player.votedOut === true)) {
+        endGame(roomCode, game, {
+            winner: 'Crewmates',
+            reason: 'votes',
+            title: 'Crewmates Win!',
+            message: 'All impostors were voted out.'
+        });
+        return;
+    }
+
+    const activePlayers = getIncludedPlayers(game).filter(player => !player.dead);
+    const activeImpostors = activePlayers.filter(player => player.team === 'Impostor').length;
+    const activeCrewmates = activePlayers.filter(player => player.team === 'Crewmate').length;
+    if (activeImpostors > 0 && activeImpostors >= activeCrewmates) {
+        endGame(roomCode, game, {
+            winner: 'Impostors',
+            reason: 'parity',
+            title: 'Impostors Win!',
+            message: 'The impostors have reached parity with the crewmates.'
+        });
+    }
+}
+
+function endGame(roomCode, game, result) {
+    if (game.status !== 'playing') return;
+
+    game.status = 'ended';
+    game.endedAt = Date.now();
+    game.endResult = result;
+    game.players.forEach(player => {
+        clearTimeout(player.disconnectTimer);
+        player.disconnectTimer = null;
+    });
+    broadcastGameUpdate(roomCode, result.message);
+    game.analytics = getGameAnalytics(game, roomCode);
+    io.to(roomCode).emit('game:ended', result);
+    io.to(game.hostId).emit('game:analytics', game.analytics);
+    console.log(`Game ended in room ${roomCode}: ${result.reason}`);
 }
 
 function isValidGameConfig(config) {
@@ -161,10 +274,10 @@ io.on('connection', (socket) => {
             meetingType: null,
             meetingReporter: null,
             meetingBodyName: null,
-            taskTotal: 0,
-            tasksDone: 0,
             pendingDeaths: [],
-            activeSabotage: null
+            activeSabotage: null,
+            endResult: null,
+            activityLog: []
         };
 
         socket.join(roomCode);
@@ -201,20 +314,28 @@ io.on('connection', (socket) => {
         }
 
         if (!player) {
+            const usedColors = game.players.map(existingPlayer => existingPlayer.color);
             player = {
                 name: playerName,
-                color: requestedColor || randomPlayerColor(),
+                color: game.players.length < 5
+                    ? getDistinctPlayerColor(usedColors)
+                    : requestedColor || getDistinctPlayerColor(usedColors),
                 role: null,
                 tasks: null,
                 dead: false
             };
             game.players.push(player);
         } else if (!isValidPlayerColor(player.color)) {
-            player.color = requestedColor || randomPlayerColor();
+            player.color = getDistinctPlayerColor(
+                game.players.filter(existingPlayer => existingPlayer !== player).map(existingPlayer => existingPlayer.color)
+            );
         }
 
         player.id = socket.id;
         player.connected = true;
+        player.disconnectedAt = null;
+        clearTimeout(player.disconnectTimer);
+        player.disconnectTimer = null;
         player.dead = player.dead === true;
         socket.join(roomCode);
 
@@ -265,6 +386,9 @@ io.on('connection', (socket) => {
                 revealElapsedMs: Date.now() - game.resultsStartedAt
             });
         }
+        if (game.status === 'ended' && game.endResult) {
+            socket.emit('game:ended', game.endResult);
+        }
 
         console.log(`${player.name} joined room ${roomCode}`);
     });
@@ -297,6 +421,13 @@ io.on('connection', (socket) => {
                 const playerName = player.name;
                 player.connected = false;
                 player.id = null;
+                player.disconnectedAt = Date.now();
+                clearTimeout(player.disconnectTimer);
+                player.disconnectTimer = setTimeout(() => {
+                    if (!player.connected && player.disconnectedAt !== null) {
+                        checkGameEnd(code, game);
+                    }
+                }, INACTIVE_PLAYER_GRACE_MS + 1);
                 io.to(code).emit('update_player_list', getPlayerList(game));
                 broadcastGameUpdate(code, `${playerName} disconnected`);
                 break;
@@ -312,8 +443,6 @@ io.on('connection', (socket) => {
         const settings = game.config.gameSettings;
         const allTasks = game.config.tasks;
 
-        game.taskTotal = 0;
-        game.tasksDone = 0;
         game.meetingActive = false;
         game.votingActive = false;
         game.resultsActive = false;
@@ -327,6 +456,11 @@ io.on('connection', (socket) => {
         game.meetingBodyName = null;
         game.pendingDeaths = [];
         game.activeSabotage = null;
+        game.endResult = null;
+        game.startedAt = Date.now();
+        game.endedAt = null;
+        game.voteHistory = [];
+        game.killHistory = [];
 
         // 1. Shuffle players and determine how many impostors to assign
         const shuffledPlayers = shuffle([...players]);
@@ -346,10 +480,6 @@ io.on('connection', (socket) => {
             player.dead = false;
             player.votedOut = false;
             player.bodyReported = false;
-            if (!isImpostor) {
-                game.taskTotal += assignedTasks.length;
-            }
-
             // Send private role and task data directly to that specific player's socket
             io.to(player.id).emit('game_started', {
                 role: player.role,
@@ -366,6 +496,7 @@ io.on('connection', (socket) => {
         io.to(roomCode).emit('meeting:state', { active: false, phase: 'none' });
         io.to(roomCode).emit('sabotage:state', { active: false });
         broadcastGameUpdate(roomCode, 'Game started');
+        checkGameEnd(roomCode, game);
         console.log(`Game started in room ${roomCode} with ${impostorCount} impostors.`);
     });
 
@@ -417,11 +548,27 @@ io.on('connection', (socket) => {
             game.votingActive = false;
             game.resultsActive = true;
             game.resultsStartedAt = Date.now();
+            const votingResults = getVotingResults(game);
             game.voteResults = {
-                ...getVotingResults(game),
+                ...votingResults,
                 revealElapsedMs: 0,
                 revealIntervalMs: 2000
             };
+            game.voteHistory.push({
+                meeting: game.voteHistory.length + 1,
+                recordedAt: new Date(game.resultsStartedAt).toISOString(),
+                votes: game.votes.map(vote => ({
+                    voter: vote.voterName,
+                    target: vote.targetName ?? 'Skip'
+                })),
+                tally: votingResults.players.map(player => ({
+                    name: player.name,
+                    votes: player.votes
+                })),
+                skipVotes: votingResults.skipVotes,
+                tied: votingResults.tied,
+                eliminated: votingResults.eliminatedName
+            });
             game.ejectedPlayer = game.voteResults.eliminatedName
                 ? game.players.find(player => player.name === game.voteResults.eliminatedName)
                 : null;
@@ -448,6 +595,8 @@ io.on('connection', (socket) => {
             if (ejectedPlayer?.connected && ejectedRole) {
                 io.to(ejectedPlayer.id).emit('player:voted_out', { role: ejectedRole });
             }
+            checkGameEnd(roomCode, game);
+            if (game.status === 'ended') return;
         } else {
             game.meetingActive = true;
             game.votingActive = false;
@@ -647,7 +796,7 @@ io.on('connection', (socket) => {
             return;
         }
 
-        const [, game] = gameEntry;
+        const [roomCode, game] = gameEntry;
         const player = game.players.find(existingPlayer => existingPlayer.id === socket.id);
         const target = game.players.find(existingPlayer => existingPlayer.id === targetId);
 
@@ -671,9 +820,15 @@ io.on('connection', (socket) => {
 
         target.dead = true;
         target.role = 'Dead';
+        game.killHistory.push({
+            timestamp: new Date().toISOString(),
+            impostor: player.name,
+            target: target.name
+        });
         game.pendingDeaths.push(target.name);
         io.to(target.id).emit('player:died', { team: target.team });
         socket.emit('player:kill_result', { success: true });
+        checkGameEnd(roomCode, game);
     });
 
     socket.on('player:sabotage', ({ sabotageId } = {}) => {
@@ -736,15 +891,12 @@ io.on('connection', (socket) => {
         const [roomCode, game] = gameEntry;
 
         const player = game.players.find(p => p.id === socket.id);
-        if (!player || !Array.isArray(player.tasks)) return;
+        if (!player || game.status !== 'playing' || !Array.isArray(player.tasks)) return;
 
         const task = player.tasks.find(t => t.id === taskId);
         if (!task || task.completed) return;
 
         task.completed = true;
-        if (player.team === 'Crewmate' || player.role === 'Crewmate') {
-            game.tasksDone++;
-        }
         console.log(`${player.name} completed task ${task.title}`);
         broadcastGameUpdate(roomCode, `${player.name} completed ${task.title}`);
 
@@ -754,17 +906,9 @@ io.on('connection', (socket) => {
             broadcastGameUpdate(roomCode, `${player.name} completed all tasks`);
         }
 
-        if (player.role === 'Crewmate' && game.taskTotal > 0 && game.tasksDone >= game.taskTotal) {
-            io.to(roomCode).emit('crewmate_win');
-            broadcastGameUpdate(roomCode, `The Crewmates have won! All tasks have been completed.`);
-            endGame(roomCode);
-        }
+        checkGameEnd(roomCode, game);
     });
 });
-
-function endGame(roomCode) {
-    console.log(`Game ended in room ${roomCode}`);
-}
 
 
 
