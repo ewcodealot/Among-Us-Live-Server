@@ -213,7 +213,7 @@ function endGame(roomCode, game, result) {
     broadcastGameUpdate(roomCode, result.message);
     game.analytics = getGameAnalytics(game, roomCode);
     io.to(roomCode).emit('game:ended', result);
-    io.to(game.hostId).emit('game:analytics', game.analytics);
+    io.to(game.hostId).emit('host:game_analytics', game.analytics);
     console.log(`Game ended in room ${roomCode}: ${result.reason}`);
 }
 
